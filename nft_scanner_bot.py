@@ -67,7 +67,7 @@ from aiogram.enums import ChatMemberStatus, ParseMode
 from aiogram.filters import Command, StateFilter
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
-from aiogram.fsm.storage.memory import MemoryStorage
+from aiogram.fsm.storage.base import BaseStorage, StorageKey
 from aiogram.types import (
     BufferedInputFile,
     CallbackQuery,
@@ -965,6 +965,7 @@ class AdminFlow(StatesGroup):
     waiting_trait_emoji = State()          # منتظر پیام حاوی ایموجی پرمیوم برای یک مدل/بک‌گراند
     waiting_toggle_mark_emoji = State()    # منتظر ایموجی جدید برای علامت انتخاب‌شده/نشده/قفلِ دکمه‌ها
     waiting_credit_user = State()          # منتظر آیدی کاربر برای شارژ موجودی
+    waiting_credit_price = State()          # منتظر قیمت اعتبار به TON
     waiting_credit_amount = State()        # منتظر تعداد GRAM برای واریز
     waiting_button_text = State()            # منتظر متن جدید دکمه‌های پرداخت
     waiting_button_emoji = State()           # منتظر ایموجی پرمیوم دکمه‌های پرداخت
@@ -1220,8 +1221,125 @@ def _get_conn() -> sqlite3.Connection:
     return conn
 
 
+
+
+class SQLiteFSMStorage(BaseStorage):
+    """
+    Persistent FSM storage backed by the bot's existing SQLite database.
+
+    This intentionally uses the same DB that is already placed on Railway's
+    persistent Volume, so FSM state/data survive container restarts without
+    introducing a second external service such as Redis.
+    """
+
+    @staticmethod
+    def _key_id(key: StorageKey) -> str:
+        fields = getattr(key, "_fields", ())
+        if fields:
+            values = [getattr(key, name, None) for name in fields]
+        else:
+            # Compatible fallback for aiogram versions whose StorageKey is not
+            # a named tuple with _fields exposed.
+            values = [
+                getattr(key, "bot_id", None),
+                getattr(key, "chat_id", None),
+                getattr(key, "user_id", None),
+                getattr(key, "destiny", None),
+                getattr(key, "business_connection_id", None),
+                getattr(key, "thread_id", None),
+            ]
+        return json.dumps(values, ensure_ascii=False, separators=(",", ":"), default=str)
+
+    async def set_state(self, key: StorageKey, state: Optional[str] = None) -> None:
+        key_id = self._key_id(key)
+
+        def _run():
+            conn = _get_conn()
+            conn.execute(
+                """
+                INSERT INTO fsm_storage (key_id, state, data, updated_at)
+                VALUES (?, ?, COALESCE((SELECT data FROM fsm_storage WHERE key_id=?), '{}'), ?)
+                ON CONFLICT(key_id) DO UPDATE SET
+                    state=excluded.state,
+                    updated_at=excluded.updated_at
+                """,
+                (key_id, state, key_id, int(time.time())),
+            )
+            conn.commit()
+
+        async with _db_lock:
+            await asyncio.to_thread(_run)
+
+    async def get_state(self, key: StorageKey) -> Optional[str]:
+        key_id = self._key_id(key)
+
+        def _run():
+            row = _get_conn().execute(
+                "SELECT state FROM fsm_storage WHERE key_id=?", (key_id,)
+            ).fetchone()
+            return row[0] if row else None
+
+        async with _db_lock:
+            return await asyncio.to_thread(_run)
+
+    async def set_data(self, key: StorageKey, data: dict) -> None:
+        key_id = self._key_id(key)
+        encoded = json.dumps(data, ensure_ascii=False, separators=(",", ":"), default=str)
+
+        def _run():
+            conn = _get_conn()
+            conn.execute(
+                """
+                INSERT INTO fsm_storage (key_id, state, data, updated_at)
+                VALUES (?, COALESCE((SELECT state FROM fsm_storage WHERE key_id=?), NULL), ?, ?)
+                ON CONFLICT(key_id) DO UPDATE SET
+                    data=excluded.data,
+                    updated_at=excluded.updated_at
+                """,
+                (key_id, key_id, encoded, int(time.time())),
+            )
+            conn.commit()
+
+        async with _db_lock:
+            await asyncio.to_thread(_run)
+
+    async def get_data(self, key: StorageKey) -> dict:
+        key_id = self._key_id(key)
+
+        def _run():
+            row = _get_conn().execute(
+                "SELECT data FROM fsm_storage WHERE key_id=?", (key_id,)
+            ).fetchone()
+            if not row or not row[0]:
+                return {}
+            try:
+                value = json.loads(row[0])
+                return value if isinstance(value, dict) else {}
+            except (TypeError, ValueError, json.JSONDecodeError):
+                log.exception("Invalid FSM data in SQLite for key %s", key_id)
+                return {}
+
+        async with _db_lock:
+            return await asyncio.to_thread(_run)
+
+    async def close(self) -> None:
+        # The application's SQLite connection lifecycle is managed by the
+        # existing DB layer. There is no separate network resource here.
+        return None
+
+
 def _init_db():
     conn = _get_conn()
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS fsm_storage (
+            key_id TEXT PRIMARY KEY,
+            state TEXT,
+            data TEXT NOT NULL DEFAULT '{}',
+            updated_at INTEGER NOT NULL
+        ) WITHOUT ROWID
+        """
+    )
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS items (
@@ -7341,7 +7459,7 @@ async def main():
     await db_load_settings()
     scanner.update_limits(get_max_concurrent(), get_max_per_second())
     bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
-    dp = Dispatcher(storage=MemoryStorage())
+    dp = Dispatcher(storage=SQLiteFSMStorage())
     dp.include_router(router)
     ton_worker_task = asyncio.create_task(ton_payment_worker(bot))
 
