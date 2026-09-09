@@ -1,0 +1,8 @@
+[build]
+builder = "DOCKERFILE"
+dockerfilePath = "Dockerfile"
+
+[deploy]
+startCommand = "python nft_scanner_bot.py"
+restartPolicyType = "ON_FAILURE"
+restartPolicyMaxRetries = 10

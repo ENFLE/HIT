@@ -1,0 +1,5 @@
+aiogram>=3.4,<4
+aiohttp>=3.9,<4
+beautifulsoup4>=4.12,<5
+Pillow>=10.0,<12
+python-dotenv>=1.0
